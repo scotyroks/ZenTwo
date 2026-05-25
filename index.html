@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ZenTwo — Photon Garden</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="stage">
+  <canvas id="view"></canvas>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="toolbar">
+  <div class="group" id="tools">
+    <button class="tool active" data-tool="light"  title="Light source — click to place">
+      <span class="dot light"></span><span>Light</span>
+    </button>
+    <button class="tool" data-tool="diffuse"  title="Diffuse wall — scatters light">
+      <span class="dot diffuse"></span><span>Diffuse</span>
+    </button>
+    <button class="tool" data-tool="mirror"   title="Mirror — reflects light">
+      <span class="dot mirror"></span><span>Mirror</span>
+    </button>
+    <button class="tool" data-tool="glass"    title="Glass — refracts light">
+      <span class="dot glass"></span><span>Glass</span>
+    </button>
+    <button class="tool" data-tool="erase"    title="Erase — click a wall to remove">
+      <span class="dot erase"></span><span>Erase</span>
+    </button>
+  </div>
+
+  <div class="group">
+    <label class="slider">
+      <span>Exposure</span>
+      <input id="exposure" type="range" min="-3" max="3" step="0.05" value="0" />
+    </label>
+  </div>
+
+  <div class="group">
+    <button id="undo"  title="Undo">Undo</button>
+    <button id="redo"  title="Redo">Redo</button>
+    <button id="clear" title="Clear all walls">Clear</button>
+    <button id="save"  title="Save PNG">Save PNG</button>
+  </div>
+</div>
+
+<div id="stats">
+  <span id="rays">0 rays</span>
+  <span id="rps">0 rays/s</span>
+</div>
+
+<div id="hint">
+  Click to place the light. Pick a material and drag to draw walls.
+</div>
+
+<script src="main.js"></script>
+</body>
+</html>
