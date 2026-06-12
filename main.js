@@ -1,5 +1,7 @@
-// Main thread: UI, scene editing, display.
-// Owns the canvas, sends scene to worker, receives accumulator and tone-maps.
+// Main thread: UI and scene editing only. All tracing and tone mapping
+// happens in the worker; rendered RGBA frames arrive via transferable
+// buffers that are ping-ponged back after putImageData (zero steady-state
+// allocation).
 
 const TYPE_DIFFUSE = 0;
 const TYPE_MIRROR  = 1;
@@ -22,8 +24,6 @@ const raysEl = document.getElementById('rays');
 const rpsEl  = document.getElementById('rps');
 
 let W = 0, H = 0;
-let imageData = null;
-let imageBuf32 = null;
 
 // Scene state.
 let light = null;                // {x,y}
@@ -31,12 +31,15 @@ let segments = [];               // [{x1,y1,x2,y2,type}]
 let history = [];                // snapshots for undo
 let future = [];                 // snapshots for redo
 let tool = 'light';
-let dragging = null;             // {x1,y1,x2,y2,type} during drag
+let dragging = null;             // wall being drawn
+let draggingLight = false;
 
 let raysTraced = 0;
 let lastRays = 0;
 let lastRpsTime = performance.now();
-let rps = 0;
+
+const PREVIEW_MS = 80;           // live-render throttle while dragging
+let lastSceneSend = 0;
 
 const worker = new Worker('worker.js');
 worker.onmessage = onWorkerMessage;
@@ -55,12 +58,16 @@ function initCanvas() {
     cancelAnimationFrame(raf);
     raf = requestAnimationFrame(resize);
   });
+  // Pause tracing in hidden tabs (saves battery; accumulation resumes).
+  document.addEventListener('visibilitychange', () => {
+    worker.postMessage({ type: document.hidden ? 'stop' : 'start' });
+  });
 }
 
 function resize() {
   const cssW = window.innerWidth;
   const cssH = window.innerHeight;
-  // Cap total pixel count for performance (~750k, ~3MB float buffer).
+  // Cap total pixel count for performance (~750k, ~9MB accumulator).
   const budget = 750000;
   const scale = Math.min(1, Math.sqrt(budget / (cssW * cssH)));
   W = Math.max(64, Math.floor(cssW * scale));
@@ -69,13 +76,11 @@ function resize() {
   view.height = H;
   overlay.width = W;
   overlay.height = H;
-  imageData = vctx.createImageData(W, H);
-  imageBuf32 = new Uint32Array(imageData.data.buffer);
 
-  // Place light in the center if none.
   if (!light) light = { x: W / 2, y: H / 2 };
 
   worker.postMessage({ type: 'init', width: W, height: H });
+  worker.postMessage({ type: 'exposure', value: Math.pow(2, parseFloat(expSlider.value)) });
   resendScene();
   drawOverlay();
   worker.postMessage({ type: 'start' });
@@ -84,25 +89,24 @@ function resize() {
 // --- Default scene ----------------------------------------------------------
 
 function seedDefaultScene() {
-  // Build a sample scene: a few mirrors and a glass slab so first-launch
-  // already shows something beautiful.
-  const cx = W / 2, cy = H / 2;
-  const r = Math.min(W, H) * 0.32;
-  light = { x: cx, y: cy };
+  // Newton's experiment: a slit collimates the point source into a beam
+  // before the prism — an omnidirectional source alone re-mixes the
+  // per-angle rainbows back to white, so the slit is what makes the
+  // dispersion fan visible. The fan lands on diffuse walls to the right.
+  const G = TYPE_GLASS, D = TYPE_DIFFUSE;
+  const cy = H * 0.5;
+  const gap = Math.max(3, 0.008 * Math.min(W, H));
+  const p = 0.16 * Math.min(W, H);          // prism half-base
+  const px = W * 0.5, py = H * 0.50;        // prism center
+  light = { x: W * 0.12, y: cy };
   segments = [
-    // Mirror triangle around the light.
-    { x1: cx - r,        y1: cy + r * 0.9,
-      x2: cx + r,        y2: cy + r * 0.9, type: TYPE_MIRROR },
-    { x1: cx - r,        y1: cy + r * 0.9,
-      x2: cx - r * 1.4,  y2: cy - r * 0.6, type: TYPE_MIRROR },
-    { x1: cx + r,        y1: cy + r * 0.9,
-      x2: cx + r * 1.4,  y2: cy - r * 0.6, type: TYPE_MIRROR },
-    // Diffuse top.
-    { x1: cx - r * 1.4,  y1: cy - r * 0.6,
-      x2: cx + r * 1.4,  y2: cy - r * 0.6, type: TYPE_DIFFUSE },
-    // Glass shard in the middle.
-    { x1: cx - r * 0.35, y1: cy + r * 0.25,
-      x2: cx + r * 0.35, y2: cy + r * 0.55, type: TYPE_GLASS },
+    { x1: W * 0.32, y1: -0.1 * H,    x2: W * 0.32, y2: cy - gap,   type: D },
+    { x1: W * 0.32, y1: cy + gap,    x2: W * 0.32, y2: 1.1 * H,    type: D },
+    { x1: px,       y1: py - 0.95 * p, x2: px - p, y2: py + 0.78 * p, type: G },
+    { x1: px - p,   y1: py + 0.78 * p, x2: px + p, y2: py + 0.78 * p, type: G },
+    { x1: px + p,   y1: py + 0.78 * p, x2: px,     y2: py - 0.95 * p, type: G },
+    { x1: W * 0.25, y1: H * 0.92,    x2: W * 0.97, y2: H * 0.92,   type: D },
+    { x1: W * 0.90, y1: H * 0.20,    x2: W * 0.90, y2: H * 0.92,   type: D },
   ];
   history = [];
   future = [];
@@ -110,11 +114,15 @@ function seedDefaultScene() {
 
 // --- Worker bridge ----------------------------------------------------------
 
-function resendScene() {
+function resendScene(extraSeg, throttled) {
   if (!light) return;
+  const now = performance.now();
+  if (throttled && now - lastSceneSend < PREVIEW_MS) return;
+  lastSceneSend = now;
+  const segs = extraSeg ? segments.concat([extraSeg]) : segments.slice();
   worker.postMessage({
     type: 'scene',
-    segments: segments.slice(),
+    segments: segs,
     light: { x: light.x, y: light.y },
   });
   raysTraced = 0;
@@ -124,43 +132,22 @@ function resendScene() {
 function onWorkerMessage(e) {
   const m = e.data;
   if (m.type !== 'frame') return;
-  const accum = new Float32Array(m.buffer);
+  const img = new ImageData(new Uint8ClampedArray(m.buffer), m.width, m.height);
+  vctx.putImageData(img, 0, 0);
   raysTraced = m.rays;
-  toneMapAndDraw(accum);
   updateStats();
-  worker.postMessage({ type: 'ack' });
-}
-
-// --- Tone mapping -----------------------------------------------------------
-
-function toneMapAndDraw(accum) {
-  // Brightness scales with rays traced, so normalize by ray count to keep
-  // the look stable as the image converges. Reinhard tone map + sqrt gamma
-  // keeps the hot inner loop free of Math.exp / Math.pow.
-  const exposure = Math.pow(2, parseFloat(expSlider.value));
-  const norm = (W * H) / Math.max(raysTraced, 1) * 0.6;
-  const k = exposure * norm;
-  const buf = imageBuf32;
-  const n = W * H;
-  const ALPHA = 0xff000000 | 0;
-  for (let i = 0; i < n; i++) {
-    const x = accum[i] * k;
-    const v = x / (1 + x);           // Reinhard
-    const c = (Math.sqrt(v) * 255) | 0; // gamma ~2.0
-    const cc = c > 255 ? 255 : c;
-    buf[i] = ALPHA | (cc << 16) | (cc << 8) | cc;
-  }
-  vctx.putImageData(imageData, 0, 0);
+  // Return the buffer to the worker's pool.
+  worker.postMessage({ type: 'ack', buffer: m.buffer }, [m.buffer]);
 }
 
 function updateStats() {
   const now = performance.now();
   const dt = now - lastRpsTime;
   if (dt > 500) {
-    rps = (raysTraced - lastRays) * 1000 / dt;
+    const rps = (raysTraced - lastRays) * 1000 / dt;
     lastRays = raysTraced;
     lastRpsTime = now;
-    rpsEl.textContent = formatNumber(rps) + ' rays/s';
+    if (rps >= 0) rpsEl.textContent = formatNumber(rps) + ' rays/s';
   }
   raysEl.textContent = formatNumber(raysTraced) + ' rays';
 }
@@ -177,7 +164,6 @@ function formatNumber(n) {
 function drawOverlay() {
   octx.clearRect(0, 0, W, H);
 
-  // Existing segments (faint).
   octx.lineWidth = 1;
   for (const s of segments) {
     octx.strokeStyle = withAlpha(COLORS[s.type], 0.45);
@@ -187,7 +173,6 @@ function drawOverlay() {
     octx.stroke();
   }
 
-  // In-progress drag.
   if (dragging) {
     octx.lineWidth = 1.5;
     octx.strokeStyle = COLORS[dragging.type];
@@ -197,12 +182,10 @@ function drawOverlay() {
     octx.stroke();
   }
 
-  // Light marker.
   if (light) {
-    const r = 5;
     octx.fillStyle = '#ffd76a';
     octx.beginPath();
-    octx.arc(light.x, light.y, r, 0, Math.PI * 2);
+    octx.arc(light.x, light.y, 5, 0, Math.PI * 2);
     octx.fill();
     octx.strokeStyle = 'rgba(0,0,0,0.6)';
     octx.lineWidth = 1;
@@ -228,7 +211,7 @@ function bindUI() {
   }
 
   expSlider.addEventListener('input', () => {
-    // Exposure only affects display, no need to restart.
+    worker.postMessage({ type: 'exposure', value: Math.pow(2, parseFloat(expSlider.value)) });
   });
 
   document.getElementById('undo').addEventListener('click', undo);
@@ -253,7 +236,6 @@ function bindUI() {
   overlay.addEventListener('pointermove', onPointerMove);
   overlay.addEventListener('pointerup', onPointerUp);
   overlay.addEventListener('pointercancel', onPointerUp);
-  // Prevent context menu interfering with drawing on right-click.
   overlay.addEventListener('contextmenu', (e) => e.preventDefault());
 }
 
@@ -271,6 +253,7 @@ function onPointerDown(e) {
   if (tool === 'light') {
     pushHistory();
     light = { x: p.x, y: p.y };
+    draggingLight = true;
     drawOverlay();
     resendScene();
     return;
@@ -291,14 +274,27 @@ function onPointerDown(e) {
 }
 
 function onPointerMove(e) {
+  if (draggingLight) {
+    const p = eventToCanvas(e);
+    light = { x: p.x, y: p.y };
+    drawOverlay();
+    resendScene(null, true);
+    return;
+  }
   if (!dragging) return;
   const p = eventToCanvas(e);
   dragging.x2 = p.x;
   dragging.y2 = p.y;
   drawOverlay();
+  resendScene(dragging, true); // live render preview while drawing
 }
 
 function onPointerUp(e) {
+  if (draggingLight) {
+    draggingLight = false;
+    resendScene();
+    return;
+  }
   if (!dragging) return;
   const p = eventToCanvas(e);
   dragging.x2 = p.x;
@@ -308,10 +304,10 @@ function onPointerUp(e) {
   if (Math.hypot(dx, dy) >= 2) {
     pushHistory();
     segments.push(dragging);
-    resendScene();
   }
   dragging = null;
   drawOverlay();
+  resendScene();
 }
 
 function typeFromTool(t) {
@@ -374,7 +370,6 @@ function redo() {
 // --- Save -------------------------------------------------------------------
 
 function savePng() {
-  // Composite the rendered view (without the overlay) into a new canvas.
   const out = document.createElement('canvas');
   out.width = W;
   out.height = H;
