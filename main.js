@@ -58,7 +58,7 @@ let lastRpsTime = performance.now();
 const PREVIEW_MS = 80;           // live-render throttle while dragging
 let lastSceneSend = 0;
 
-const worker = new Worker('worker.js');
+const worker = new Worker('worker.js?v=4'); // keep in sync with index.html ?v=
 worker.onmessage = onWorkerMessage;
 worker.onerror = (e) => {
   hintEl.textContent = 'Renderer failed to start — serve over HTTP (not file://). ' + (e.message || '');
