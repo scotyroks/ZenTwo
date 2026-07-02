@@ -41,6 +41,7 @@ html, body {
 #overlay {
   pointer-events: auto;
   cursor: crosshair;
+  touch-action: none; /* draw with fingers/stylus without page pan/zoom */
 }
 
 #toolbar {
@@ -59,6 +60,7 @@ html, body {
   -webkit-backdrop-filter: blur(12px);
   z-index: 10;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  touch-action: manipulation; /* no double-tap zoom on buttons */
 }
 
 .group {
@@ -86,6 +88,7 @@ button {
   transition: background 0.12s, border-color 0.12s;
 }
 button:hover { background: rgba(255, 255, 255, 0.06); }
+button:active { transform: translateY(1px); }
 button.active {
   background: rgba(255, 255, 255, 0.08);
   border-color: rgba(255, 255, 255, 0.18);
@@ -145,6 +148,11 @@ button.active {
   z-index: 10;
   max-width: 320px;
   text-align: right;
+  transition: opacity 0.6s;
+}
+#hint.hide {
+  opacity: 0;
+  pointer-events: none;
 }
 
 @media (max-width: 640px) {

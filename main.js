@@ -22,17 +22,20 @@ const toolButtons = document.querySelectorAll('.tool');
 const expSlider = document.getElementById('exposure');
 const raysEl = document.getElementById('rays');
 const rpsEl  = document.getElementById('rps');
+const hintEl = document.getElementById('hint');
 
 let W = 0, H = 0;
 
 // Scene state.
 let light = null;                // {x,y}
 let segments = [];               // [{x1,y1,x2,y2,type}]
-let history = [];                // snapshots for undo
-let future = [];                 // snapshots for redo
+let undoStack = [];
+let redoStack = [];
 let tool = 'light';
 let dragging = null;             // wall being drawn
 let draggingLight = false;
+let erasing = false;
+let eraseSnapshot = null;        // history entry deferred until first removal
 
 let raysTraced = 0;
 let lastRays = 0;
@@ -43,11 +46,26 @@ let lastSceneSend = 0;
 
 const worker = new Worker('worker.js');
 worker.onmessage = onWorkerMessage;
+worker.onerror = (e) => {
+  hintEl.textContent = 'Renderer failed to start — serve over HTTP (not file://). ' + (e.message || '');
+  hintEl.classList.remove('hide');
+};
 
+// Capture before initCanvas: resize() → resendScene() → updateHash()
+// rewrites location.hash, which would destroy an incoming shared link.
+const initialHash = location.hash;
 initCanvas();
-seedDefaultScene();
+if (!loadSceneFromHash(initialHash)) seedDefaultScene();
 bindUI();
 resendScene();
+
+// Loading a pasted link into a running app (replaceState doesn't fire this).
+window.addEventListener('hashchange', () => {
+  if (loadSceneFromHash(location.hash)) {
+    drawOverlay();
+    resendScene();
+  }
+});
 
 // --- Init / resize ----------------------------------------------------------
 
@@ -65,6 +83,7 @@ function initCanvas() {
 }
 
 function resize() {
+  const oldW = W, oldH = H;
   const cssW = window.innerWidth;
   const cssH = window.innerHeight;
   // Cap total pixel count for performance (~750k, ~9MB accumulator).
@@ -78,12 +97,29 @@ function resize() {
   overlay.height = H;
 
   if (!light) light = { x: W / 2, y: H / 2 };
+  else if (oldW > 0 && (oldW !== W || oldH !== H)) {
+    rescaleScene(W / oldW, H / oldH);
+  }
 
   worker.postMessage({ type: 'init', width: W, height: H });
   worker.postMessage({ type: 'exposure', value: Math.pow(2, parseFloat(expSlider.value)) });
   resendScene();
   drawOverlay();
   worker.postMessage({ type: 'start' });
+}
+
+// Keep the composition proportional when the window changes size.
+function rescaleScene(fx, fy) {
+  const scaleSeg = (s) => {
+    s.x1 *= fx; s.y1 *= fy; s.x2 *= fx; s.y2 *= fy;
+  };
+  light.x *= fx; light.y *= fy;
+  segments.forEach(scaleSeg);
+  if (dragging) scaleSeg(dragging);
+  for (const snap of undoStack.concat(redoStack)) {
+    snap.light.x *= fx; snap.light.y *= fy;
+    snap.segments.forEach(scaleSeg);
+  }
 }
 
 // --- Default scene ----------------------------------------------------------
@@ -108,8 +144,60 @@ function seedDefaultScene() {
     { x1: W * 0.25, y1: H * 0.92,    x2: W * 0.97, y2: H * 0.92,   type: D },
     { x1: W * 0.90, y1: H * 0.20,    x2: W * 0.90, y2: H * 0.92,   type: D },
   ];
-  history = [];
-  future = [];
+  undoStack = [];
+  redoStack = [];
+}
+
+// --- Shareable URLs ----------------------------------------------------------
+
+// Scene → compact hash: "#s=t,x1,y1,x2,y2;...|lx,ly" with coordinates
+// normalized to the canvas so links are resolution-independent.
+function serializeScene() {
+  const r = (v) => Math.round(v * 10000) / 10000;
+  const segs = segments
+    .map((s) => [s.type, r(s.x1 / W), r(s.y1 / H), r(s.x2 / W), r(s.y2 / H)].join(','))
+    .join(';');
+  return segs + '|' + r(light.x / W) + ',' + r(light.y / H);
+}
+
+function parseScene(str) {
+  const [segPart, lightPart] = str.split('|');
+  if (lightPart === undefined) return null;
+  const lp = lightPart.split(',').map(Number);
+  if (lp.length !== 2 || !lp.every(Number.isFinite)) return null;
+  const segs = [];
+  if (segPart !== '') {
+    for (const chunk of segPart.split(';')) {
+      const v = chunk.split(',').map(Number);
+      if (v.length !== 5 || !v.every(Number.isFinite)) return null;
+      const type = v[0] | 0;
+      if (type < 0 || type > 2) return null;
+      segs.push({ x1: v[1] * W, y1: v[2] * H, x2: v[3] * W, y2: v[4] * H, type });
+      if (segs.length > 1000) return null;
+    }
+  }
+  return { light: { x: lp[0] * W, y: lp[1] * H }, segments: segs };
+}
+
+function loadSceneFromHash(hash) {
+  const m = hash.match(/^#s=(.+)$/);
+  if (!m) return false;
+  try {
+    const scene = parseScene(decodeURIComponent(m[1]));
+    if (!scene) return false;
+    light = scene.light;
+    segments = scene.segments;
+    undoStack = [];
+    redoStack = [];
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function updateHash() {
+  // replaceState avoids polluting browser history on every edit.
+  window.history.replaceState(null, '', '#s=' + serializeScene());
 }
 
 // --- Worker bridge ----------------------------------------------------------
@@ -127,6 +215,7 @@ function resendScene(extraSeg, throttled) {
   });
   raysTraced = 0;
   lastRays = 0;
+  if (!throttled && !extraSeg) updateHash();
 }
 
 function onWorkerMessage(e) {
@@ -202,16 +291,31 @@ function withAlpha(hex, a) {
 
 // --- Input handling ---------------------------------------------------------
 
+const TOOL_KEYS = {
+  '1': 'light',   l: 'light',
+  '2': 'diffuse', d: 'diffuse',
+  '3': 'mirror',  m: 'mirror',
+  '4': 'glass',   g: 'glass',
+  '5': 'erase',   e: 'erase',
+};
+
+function selectTool(name) {
+  tool = name;
+  toolButtons.forEach((b) => b.classList.toggle('active', b.dataset.tool === name));
+  overlay.style.cursor = name === 'erase' ? 'cell' : 'crosshair';
+}
+
 function bindUI() {
   for (const btn of toolButtons) {
-    btn.addEventListener('click', () => {
-      tool = btn.dataset.tool;
-      toolButtons.forEach((b) => b.classList.toggle('active', b === btn));
-    });
+    btn.addEventListener('click', () => selectTool(btn.dataset.tool));
   }
 
   expSlider.addEventListener('input', () => {
     worker.postMessage({ type: 'exposure', value: Math.pow(2, parseFloat(expSlider.value)) });
+  });
+  expSlider.addEventListener('dblclick', () => {
+    expSlider.value = 0;
+    expSlider.dispatchEvent(new Event('input'));
   });
 
   document.getElementById('undo').addEventListener('click', undo);
@@ -223,13 +327,18 @@ function bindUI() {
     resendScene();
   });
   document.getElementById('save').addEventListener('click', savePng);
+  document.getElementById('share').addEventListener('click', shareLink);
 
   window.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'INPUT') return;
-    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); }
-    else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) {
-      e.preventDefault(); redo();
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) { e.preventDefault(); undo(); return; }
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) {
+      e.preventDefault(); redo(); return;
     }
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key === 'Escape') { cancelDrag(); return; }
+    const t = TOOL_KEYS[e.key.toLowerCase()];
+    if (t) selectTool(t);
   });
 
   overlay.addEventListener('pointerdown', onPointerDown);
@@ -237,6 +346,8 @@ function bindUI() {
   overlay.addEventListener('pointerup', onPointerUp);
   overlay.addEventListener('pointercancel', onPointerUp);
   overlay.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  selectTool(tool);
 }
 
 function eventToCanvas(e) {
@@ -245,6 +356,10 @@ function eventToCanvas(e) {
     x: (e.clientX - rect.left) * (W / rect.width),
     y: (e.clientY - rect.top)  * (H / rect.height),
   };
+}
+
+function dismissHint() {
+  hintEl.classList.add('hide');
 }
 
 function onPointerDown(e) {
@@ -259,13 +374,9 @@ function onPointerDown(e) {
     return;
   }
   if (tool === 'erase') {
-    const idx = findSegmentNear(p.x, p.y, 6);
-    if (idx >= 0) {
-      pushHistory();
-      segments.splice(idx, 1);
-      drawOverlay();
-      resendScene();
-    }
+    erasing = true;
+    eraseSnapshot = snapshot();
+    eraseAt(p);
     return;
   }
   const type = typeFromTool(tool);
@@ -281,6 +392,10 @@ function onPointerMove(e) {
     resendScene(null, true);
     return;
   }
+  if (erasing) {
+    eraseAt(eventToCanvas(e));
+    return;
+  }
   if (!dragging) return;
   const p = eventToCanvas(e);
   dragging.x2 = p.x;
@@ -292,7 +407,13 @@ function onPointerMove(e) {
 function onPointerUp(e) {
   if (draggingLight) {
     draggingLight = false;
+    dismissHint();
     resendScene();
+    return;
+  }
+  if (erasing) {
+    erasing = false;
+    eraseSnapshot = null;
     return;
   }
   if (!dragging) return;
@@ -304,8 +425,37 @@ function onPointerUp(e) {
   if (Math.hypot(dx, dy) >= 2) {
     pushHistory();
     segments.push(dragging);
+    dismissHint();
   }
   dragging = null;
+  drawOverlay();
+  resendScene();
+}
+
+function cancelDrag() {
+  if (draggingLight) {
+    draggingLight = false;
+    undo(); // light position was snapshotted on pointerdown
+    return;
+  }
+  if (dragging) {
+    dragging = null;
+    drawOverlay();
+    resendScene();
+  }
+}
+
+// Erase every segment under the pointer; one undo step per erase gesture.
+function eraseAt(p) {
+  const idx = findSegmentNear(p.x, p.y, 6);
+  if (idx < 0) return;
+  if (eraseSnapshot) {
+    undoStack.push(eraseSnapshot);
+    if (undoStack.length > 100) undoStack.shift();
+    redoStack.length = 0;
+    eraseSnapshot = null;
+  }
+  segments.splice(idx, 1);
   drawOverlay();
   resendScene();
 }
@@ -340,9 +490,9 @@ function pointSegmentDist(px, py, s) {
 // --- History ----------------------------------------------------------------
 
 function pushHistory() {
-  history.push(snapshot());
-  if (history.length > 100) history.shift();
-  future.length = 0;
+  undoStack.push(snapshot());
+  if (undoStack.length > 100) undoStack.shift();
+  redoStack.length = 0;
 }
 function snapshot() {
   return {
@@ -357,17 +507,17 @@ function restore(snap) {
   resendScene();
 }
 function undo() {
-  if (!history.length) return;
-  future.push(snapshot());
-  restore(history.pop());
+  if (!undoStack.length) return;
+  redoStack.push(snapshot());
+  restore(undoStack.pop());
 }
 function redo() {
-  if (!future.length) return;
-  history.push(snapshot());
-  restore(future.pop());
+  if (!redoStack.length) return;
+  undoStack.push(snapshot());
+  restore(redoStack.pop());
 }
 
-// --- Save -------------------------------------------------------------------
+// --- Save / share -------------------------------------------------------------
 
 function savePng() {
   const out = document.createElement('canvas');
@@ -378,9 +528,25 @@ function savePng() {
   out.toBlob((blob) => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
+    const ts = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
     a.href = url;
-    a.download = 'zentwo.png';
+    a.download = `zentwo-${ts}.png`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }, 'image/png');
+}
+
+function shareLink() {
+  updateHash();
+  const btn = document.getElementById('share');
+  const done = () => {
+    const label = btn.textContent;
+    btn.textContent = 'Copied ✓';
+    setTimeout(() => { btn.textContent = label; }, 1200);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(location.href).then(done, () => prompt('Copy link:', location.href));
+  } else {
+    prompt('Copy link:', location.href);
+  }
 }

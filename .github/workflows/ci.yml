@@ -1,0 +1,18 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          node --check main.js
+          node --check worker.js
+          node --check test/smoke.js
+      - name: Physics smoke test
+        run: node test/smoke.js

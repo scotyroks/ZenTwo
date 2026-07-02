@@ -13,12 +13,23 @@ Web Workers can't load over `file://`, so serve the directory:
 python3 -m http.server 8000   # then open http://localhost:8000
 ```
 
+Or open the hosted build if GitHub Pages is enabled for this repository
+(Settings → Pages → Source: **GitHub Actions**); every push to `main`
+deploys automatically.
+
 ## Controls
 
-- **Light** — click or drag to move the source
-- **Diffuse / Mirror / Glass** — drag to draw a wall segment
-- **Erase** — click near a segment to remove it
-- Exposure slider, Undo (`⌘Z`), Redo (`⌘⇧Z`), Clear, Save PNG
+- **Light** — click or drag to move the source (`1`/`L`)
+- **Diffuse / Mirror / Glass** — drag to draw a wall segment (`2`/`D`, `3`/`M`, `4`/`G`)
+- **Erase** — click or drag over segments to remove them (`5`/`E`)
+- Exposure slider (double-click resets), Undo (`⌘Z`), Redo (`⌘⇧Z`), Clear
+- **Save PNG** — download the current render
+- **Share** — copy a link that reproduces the scene; scenes are encoded in
+  the URL hash with resolution-independent coordinates
+- `Esc` cancels an in-progress drag; touch and stylus input work directly
+  on the canvas
+
+The scene rescales proportionally when the window is resized.
 
 ## Physics
 
