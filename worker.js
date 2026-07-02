@@ -6,12 +6,15 @@
 //    derived from the CIE 1931 color matching functions (Wyman/Sloan/Shirley
 //    piecewise-Gaussian fits, JCGT 2013), white-balanced so the full
 //    spectrum integrates to neutral white.
+//  - Geometry is line segments plus circular arcs. Arcs are exact
+//    (analytic ray-circle intersection with radial normals), so lenses
+//    behave like real spherical optics, spherical aberration included.
 //  - Glass is SCHOTT N-BK7: index of refraction from the Sellmeier equation,
 //    so dispersion (rainbow separation) is physically correct.
-//  - Glass interfaces use the exact unpolarized→polarized Fresnel equations.
-//    In 2D the plane of incidence is the simulation plane itself, so s/p
-//    polarization state is tracked exactly per photon and compounds
-//    correctly across multiple interfaces (Brewster-angle behavior is real).
+//  - Glass interfaces use the exact dielectric Fresnel equations. In 2D the
+//    plane of incidence is the simulation plane itself, so s/p polarization
+//    state is tracked exactly per photon and compounds correctly across
+//    multiple interfaces (Brewster-angle behavior is real).
 //  - Diffuse walls are Lambertian (cosine-weighted in 2D), albedo 0.85
 //    (matte white paint). Mirrors reflect 92% (aluminum, averaged over the
 //    visible band). Termination is Russian roulette — unbiased, no
@@ -141,13 +144,16 @@ const REFL_MIRROR    = 0.92; // aluminum, visible-band average
 const TWO_PI = Math.PI * 2;
 const GOLDEN = 0.6180339887498949; // emission angles fill via golden-ratio LDS
 const MAX_BOUNCES = 500;           // safety only; RR terminates paths
-const EPS_T = 1e-4;
+const EPS_T = 1e-4;   // segment intersection epsilon (identity-excluded too)
+const EPS_ARC = 1e-3; // arcs use epsilon only: a ray inside a lens must be
+                      // able to hit the SAME arc again on the way out
 
 // --- State -------------------------------------------------------------------
 
 let W = 0, H = 0;
 let accum = null;        // Float32Array(W*H*3), linear-sRGB energy
-let segments = [];
+let segments = [];       // {x1,y1,x2,y2,type}
+let arcs = [];           // {cx,cy,r,a0,span,type} — angles y-down, a0..a0+span
 let light = null;
 let raysTraced = 0;
 let photonIndex = 0;
@@ -178,7 +184,8 @@ self.onmessage = (e) => {
       resetAccum();
       break;
     case 'scene':
-      segments = m.segments;
+      segments = m.segments || [];
+      arcs = m.arcs || [];
       light = m.light;
       resetAccum();
       break;
@@ -270,19 +277,42 @@ function traceRay() {
 
   let inGlass = false;
   let ws = 0.5, wp = 0.5;  // s/p polarization power fractions (sum = 1)
-  let lastSeg = -1;
+  let lastSeg = -1;        // identity exclusion for straight segments only
 
   for (let bounce = 0; bounce < MAX_BOUNCES; bounce++) {
     let bestT = Infinity;
-    let bestSeg = -1;
+    let bestKind = -1;   // 0 = segment, 1 = arc
+    let bestIdx = -1;
+
     for (let i = 0; i < segments.length; i++) {
       if (i === lastSeg) continue;
       const s = segments[i];
       const t = raySegmentT(x, y, dx, dy, s.x1, s.y1, s.x2, s.y2);
-      if (t > EPS_T && t < bestT) { bestT = t; bestSeg = i; }
+      if (t > EPS_T && t < bestT) { bestT = t; bestKind = 0; bestIdx = i; }
     }
 
-    if (bestSeg < 0) {
+    for (let i = 0; i < arcs.length; i++) {
+      const a = arcs[i];
+      const ocx = x - a.cx;
+      const ocy = y - a.cy;
+      const b = dx * ocx + dy * ocy;
+      const c0 = ocx * ocx + ocy * ocy - a.r * a.r;
+      const disc = b * b - c0;
+      if (disc <= 0) continue;
+      const sq = Math.sqrt(disc);
+      // Check both roots: the near one may miss the arc's angular span
+      // while the far one (e.g. exiting a lens) hits it.
+      for (let root = 0; root < 2; root++) {
+        const t = root === 0 ? -b - sq : -b + sq;
+        if (t <= EPS_ARC || t >= bestT) continue;
+        const ang = Math.atan2(y + dy * t - a.cy, x + dx * t - a.cx);
+        let rel = ang - a.a0;
+        rel -= Math.floor(rel / TWO_PI) * TWO_PI;
+        if (rel <= a.span) { bestT = t; bestKind = 1; bestIdx = i; }
+      }
+    }
+
+    if (bestIdx < 0) {
       // Escapes to infinity; deposit() clips to the viewport.
       deposit(x, y, x + dx * 1e5, y + dy * 1e5, pr, pg, pb);
       return;
@@ -292,15 +322,24 @@ function traceRay() {
     const hy = y + dy * bestT;
     deposit(x, y, hx, hy, pr, pg, pb);
 
-    const s = segments[bestSeg];
-    const sdx = s.x2 - s.x1;
-    const sdy = s.y2 - s.y1;
-    const slen = Math.hypot(sdx, sdy) || 1;
-    let nx = -sdy / slen;
-    let ny =  sdx / slen;
+    let nx, ny, mat;
+    if (bestKind === 0) {
+      const s = segments[bestIdx];
+      mat = s.type;
+      const sdx = s.x2 - s.x1;
+      const sdy = s.y2 - s.y1;
+      const slen = Math.hypot(sdx, sdy) || 1;
+      nx = -sdy / slen;
+      ny =  sdx / slen;
+    } else {
+      const a = arcs[bestIdx];
+      mat = a.type;
+      nx = (hx - a.cx) / a.r;
+      ny = (hy - a.cy) / a.r;
+    }
     if (nx * dx + ny * dy > 0) { nx = -nx; ny = -ny; } // face the photon
 
-    if (s.type === TYPE_DIFFUSE) {
+    if (mat === TYPE_DIFFUSE) {
       if (Math.random() >= ALBEDO_DIFFUSE) return; // absorbed (RR)
       ws = 0.5; wp = 0.5; // diffuse scattering depolarizes
       // 2D Lambertian: pdf ∝ cosθ  ⇒  θ = asin(2u-1)
@@ -308,7 +347,7 @@ function traceRay() {
       const cs = Math.cos(theta), sn = Math.sin(theta);
       dx = nx * cs - ny * sn;
       dy = ny * cs + nx * sn;
-    } else if (s.type === TYPE_MIRROR) {
+    } else if (mat === TYPE_MIRROR) {
       if (Math.random() >= REFL_MIRROR) return; // absorbed (RR)
       const dn = dx * nx + dy * ny;
       dx -= 2 * dn * nx;
@@ -352,7 +391,7 @@ function traceRay() {
     dx /= dl; dy /= dl;
 
     x = hx; y = hy;
-    lastSeg = bestSeg;
+    lastSeg = bestKind === 0 ? bestIdx : -1;
   }
 }
 

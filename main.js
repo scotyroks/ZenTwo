@@ -2,6 +2,11 @@
 // happens in the worker; rendered RGBA frames arrive via transferable
 // buffers that are ping-ponged back after putImageData (zero steady-state
 // allocation).
+//
+// Scene model: a flat list of primitives (line segments and circular arcs),
+// each with a material and a group id. Shape tools (box, circle, lens)
+// emit several primitives sharing a group, so Move and Erase treat them
+// as one object. Freehand lines get singleton groups.
 
 const TYPE_DIFFUSE = 0;
 const TYPE_MIRROR  = 1;
@@ -18,7 +23,8 @@ const overlay = document.getElementById('overlay');
 const vctx = view.getContext('2d');
 const octx = overlay.getContext('2d');
 
-const toolButtons = document.querySelectorAll('.tool');
+const modeButtons = document.querySelectorAll('[data-mode]');
+const matButtons  = document.querySelectorAll('[data-mat]');
 const expSlider = document.getElementById('exposure');
 const raysEl = document.getElementById('rays');
 const rpsEl  = document.getElementById('rps');
@@ -28,14 +34,22 @@ let W = 0, H = 0;
 
 // Scene state.
 let light = null;                // {x,y}
-let segments = [];               // [{x1,y1,x2,y2,type}]
+let prims = [];                  // seg: {kind:'seg',type,group,x1,y1,x2,y2}
+                                 // arc: {kind:'arc',type,group,cx,cy,r,a0,span}
+let nextGroup = 1;
 let undoStack = [];
 let redoStack = [];
-let tool = 'light';
-let dragging = null;             // wall being drawn
-let draggingLight = false;
+
+let mode = 'light';              // light|move|line|arc|circle|box|lens|erase
+let material = TYPE_DIFFUSE;
+
+// Interaction state.
+let gesture = null;              // {x1,y1,x2,y2} for line/box/circle/lens drags
+let arcState = null;             // {ax,ay,bx,by,stage:1|2,px,py}
+let moving = null;               // {lightOnly, group, startX,startY, snap, moved}
+let draggingLight = false;       // light tool drag
 let erasing = false;
-let eraseSnapshot = null;        // history entry deferred until first removal
+let eraseSnapshot = null;
 
 let raysTraced = 0;
 let lastRays = 0;
@@ -109,17 +123,122 @@ function resize() {
 }
 
 // Keep the composition proportional when the window changes size.
+// Arcs stay circular: centers scale per-axis, radii by the geometric mean.
 function rescaleScene(fx, fy) {
-  const scaleSeg = (s) => {
-    s.x1 *= fx; s.y1 *= fy; s.x2 *= fx; s.y2 *= fy;
+  const fr = Math.sqrt(fx * fy);
+  const scalePrim = (p) => {
+    if (p.kind === 'seg') {
+      p.x1 *= fx; p.y1 *= fy; p.x2 *= fx; p.y2 *= fy;
+    } else {
+      p.cx *= fx; p.cy *= fy; p.r *= fr;
+    }
   };
   light.x *= fx; light.y *= fy;
-  segments.forEach(scaleSeg);
-  if (dragging) scaleSeg(dragging);
+  prims.forEach(scalePrim);
   for (const snap of undoStack.concat(redoStack)) {
     snap.light.x *= fx; snap.light.y *= fy;
-    snap.segments.forEach(scaleSeg);
+    snap.prims.forEach(scalePrim);
   }
+}
+
+// --- Geometry helpers ---------------------------------------------------------
+
+function seg(type, group, x1, y1, x2, y2) {
+  return { kind: 'seg', type, group, x1, y1, x2, y2 };
+}
+
+// Circumcircle through three points; null when (nearly) collinear.
+function circle3(ax, ay, bx, by, px, py) {
+  const d = 2 * (ax * (by - py) + bx * (py - ay) + px * (ay - by));
+  if (Math.abs(d) < 1e-6) return null;
+  const a2 = ax * ax + ay * ay;
+  const b2 = bx * bx + by * by;
+  const p2 = px * px + py * py;
+  const cx = (a2 * (by - py) + b2 * (py - ay) + p2 * (ay - by)) / d;
+  const cy = (a2 * (px - bx) + b2 * (ax - px) + p2 * (bx - ax)) / d;
+  return { cx, cy, r: Math.hypot(ax - cx, ay - cy) };
+}
+
+function ccwDist(a, b) {
+  let d = b - a;
+  d -= Math.floor(d / (2 * Math.PI)) * 2 * Math.PI;
+  return d;
+}
+
+// Arc from A to B passing through P (the bulge point).
+function arcFrom3(ax, ay, bx, by, px, py, type, group) {
+  const c = circle3(ax, ay, bx, by, px, py);
+  if (!c || c.r > 50000) {
+    return seg(type, group, ax, ay, bx, by); // effectively straight
+  }
+  const angA = Math.atan2(ay - c.cy, ax - c.cx);
+  const angB = Math.atan2(by - c.cy, bx - c.cx);
+  const angP = Math.atan2(py - c.cy, px - c.cx);
+  let a0, span;
+  if (ccwDist(angA, angP) <= ccwDist(angA, angB)) {
+    a0 = angA; span = ccwDist(angA, angB);
+  } else {
+    a0 = angB; span = ccwDist(angB, angA);
+  }
+  return { kind: 'arc', type, group, cx: c.cx, cy: c.cy, r: c.r, a0, span };
+}
+
+// Biconvex lens on chord A→B: two arcs bulging to either side.
+const LENS_SAGITTA = 0.22; // sagitta as a fraction of the chord length
+function makeLens(ax, ay, bx, by, type, group) {
+  const len = Math.hypot(bx - ax, by - ay);
+  const mx = (ax + bx) / 2, my = (ay + by) / 2;
+  const ux = -(by - ay) / len, uy = (bx - ax) / len;
+  const s = LENS_SAGITTA * len;
+  return [
+    arcFrom3(ax, ay, bx, by, mx + ux * s, my + uy * s, type, group),
+    arcFrom3(ax, ay, bx, by, mx - ux * s, my - uy * s, type, group),
+  ];
+}
+
+// Primitives produced by the current in-progress gesture (for live preview
+// and for committing on pointerup).
+function gesturePrims() {
+  if (arcState) {
+    if (arcState.stage === 1) {
+      return [seg(material, 0, arcState.ax, arcState.ay, arcState.bx, arcState.by)];
+    }
+    return [arcFrom3(arcState.ax, arcState.ay, arcState.bx, arcState.by,
+                     arcState.px, arcState.py, material, 0)];
+  }
+  if (!gesture) return [];
+  const { x1, y1, x2, y2 } = gesture;
+  const w = x2 - x1, h = y2 - y1;
+  const len = Math.hypot(w, h);
+  switch (mode) {
+    case 'line':
+      return len >= 2 ? [seg(material, 0, x1, y1, x2, y2)] : [];
+    case 'box':
+      if (Math.abs(w) < 3 || Math.abs(h) < 3) return [];
+      return [
+        seg(material, 0, x1, y1, x2, y1),
+        seg(material, 0, x2, y1, x2, y2),
+        seg(material, 0, x2, y2, x1, y2),
+        seg(material, 0, x1, y2, x1, y1),
+      ];
+    case 'circle':
+      if (len < 3) return [];
+      return [{ kind: 'arc', type: material, group: 0,
+                cx: x1, cy: y1, r: len, a0: 0, span: 2 * Math.PI }];
+    case 'lens':
+      return len >= 8 ? makeLens(x1, y1, x2, y2, material, 0) : [];
+  }
+  return [];
+}
+
+function commitPrims(list) {
+  if (!list.length) return;
+  pushHistory();
+  const g = nextGroup++;
+  for (const p of list) prims.push({ ...p, group: g });
+  dismissHint();
+  drawOverlay();
+  resendScene();
 }
 
 // --- Default scene ----------------------------------------------------------
@@ -135,48 +254,81 @@ function seedDefaultScene() {
   const p = 0.16 * Math.min(W, H);          // prism half-base
   const px = W * 0.5, py = H * 0.50;        // prism center
   light = { x: W * 0.12, y: cy };
-  segments = [
-    { x1: W * 0.32, y1: -0.1 * H,    x2: W * 0.32, y2: cy - gap,   type: D },
-    { x1: W * 0.32, y1: cy + gap,    x2: W * 0.32, y2: 1.1 * H,    type: D },
-    { x1: px,       y1: py - 0.95 * p, x2: px - p, y2: py + 0.78 * p, type: G },
-    { x1: px - p,   y1: py + 0.78 * p, x2: px + p, y2: py + 0.78 * p, type: G },
-    { x1: px + p,   y1: py + 0.78 * p, x2: px,     y2: py - 0.95 * p, type: G },
-    { x1: W * 0.25, y1: H * 0.92,    x2: W * 0.97, y2: H * 0.92,   type: D },
-    { x1: W * 0.90, y1: H * 0.20,    x2: W * 0.90, y2: H * 0.92,   type: D },
+  prims = [
+    seg(D, 1, W * 0.32, -0.1 * H, W * 0.32, cy - gap),
+    seg(D, 2, W * 0.32, cy + gap, W * 0.32, 1.1 * H),
+    seg(G, 3, px,     py - 0.95 * p, px - p, py + 0.78 * p),
+    seg(G, 3, px - p, py + 0.78 * p, px + p, py + 0.78 * p),
+    seg(G, 3, px + p, py + 0.78 * p, px,     py - 0.95 * p),
+    seg(D, 4, W * 0.25, H * 0.92, W * 0.97, H * 0.92),
+    seg(D, 5, W * 0.90, H * 0.20, W * 0.90, H * 0.92),
   ];
+  nextGroup = 6;
   undoStack = [];
   redoStack = [];
 }
 
 // --- Shareable URLs ----------------------------------------------------------
 
-// Scene → compact hash: "#s=t,x1,y1,x2,y2;...|lx,ly" with coordinates
-// normalized to the canvas so links are resolution-independent.
+// Scene → compact hash with resolution-independent coordinates:
+//   v2 items:  "s,mat,group,x1,y1,x2,y2" | "a,mat,group,cx,cy,r,a0,span"
+//   v1 items (legacy links): "mat,x1,y1,x2,y2"
+// joined by ';', then "|lx,ly". Radii normalize by √(W·H).
 function serializeScene() {
   const r = (v) => Math.round(v * 10000) / 10000;
-  const segs = segments
-    .map((s) => [s.type, r(s.x1 / W), r(s.y1 / H), r(s.x2 / W), r(s.y2 / H)].join(','))
+  const S = Math.sqrt(W * H);
+  const items = prims.map((p) => p.kind === 'seg'
+    ? ['s', p.type, p.group, r(p.x1 / W), r(p.y1 / H), r(p.x2 / W), r(p.y2 / H)].join(',')
+    : ['a', p.type, p.group, r(p.cx / W), r(p.cy / H), r(p.r / S), r(p.a0), r(p.span)].join(','))
     .join(';');
-  return segs + '|' + r(light.x / W) + ',' + r(light.y / H);
+  return items + '|' + r(light.x / W) + ',' + r(light.y / H);
 }
 
 function parseScene(str) {
-  const [segPart, lightPart] = str.split('|');
+  const [itemPart, lightPart] = str.split('|');
   if (lightPart === undefined) return null;
   const lp = lightPart.split(',').map(Number);
   if (lp.length !== 2 || !lp.every(Number.isFinite)) return null;
-  const segs = [];
-  if (segPart !== '') {
-    for (const chunk of segPart.split(';')) {
-      const v = chunk.split(',').map(Number);
-      if (v.length !== 5 || !v.every(Number.isFinite)) return null;
-      const type = v[0] | 0;
-      if (type < 0 || type > 2) return null;
-      segs.push({ x1: v[1] * W, y1: v[2] * H, x2: v[3] * W, y2: v[4] * H, type });
-      if (segs.length > 1000) return null;
+  const S = Math.sqrt(W * H);
+  const out = [];
+  let maxGroup = 0;
+  let autoGroup = 1000000; // singleton groups for legacy v1 items
+  if (itemPart !== '') {
+    for (const chunk of itemPart.split(';')) {
+      const f = chunk.split(',');
+      let prim;
+      if (f[0] === 's' || f[0] === 'a') {
+        const v = f.slice(1).map(Number);
+        if (!v.every(Number.isFinite)) return null;
+        const type = v[0] | 0, group = v[1] | 0;
+        if (type < 0 || type > 2 || group < 0) return null;
+        if (f[0] === 's') {
+          if (v.length !== 6) return null;
+          prim = seg(type, group, v[2] * W, v[3] * H, v[4] * W, v[5] * H);
+        } else {
+          if (v.length !== 7) return null;
+          if (v[4] <= 0 || v[6] <= 0) return null;
+          prim = { kind: 'arc', type, group, cx: v[2] * W, cy: v[3] * H,
+                   r: v[4] * S, a0: v[5], span: Math.min(v[6], 2 * Math.PI) };
+        }
+        maxGroup = Math.max(maxGroup, group);
+      } else {
+        const v = f.map(Number);
+        if (v.length !== 5 || !v.every(Number.isFinite)) return null;
+        const type = v[0] | 0;
+        if (type < 0 || type > 2) return null;
+        prim = seg(type, autoGroup++, v[1] * W, v[2] * H, v[3] * W, v[4] * H);
+        maxGroup = Math.max(maxGroup, prim.group);
+      }
+      out.push(prim);
+      if (out.length > 2000) return null;
     }
   }
-  return { light: { x: lp[0] * W, y: lp[1] * H }, segments: segs };
+  return {
+    light: { x: lp[0] * W, y: lp[1] * H },
+    prims: out,
+    nextGroup: maxGroup + 1,
+  };
 }
 
 function loadSceneFromHash(hash) {
@@ -186,7 +338,8 @@ function loadSceneFromHash(hash) {
     const scene = parseScene(decodeURIComponent(m[1]));
     if (!scene) return false;
     light = scene.light;
-    segments = scene.segments;
+    prims = scene.prims;
+    nextGroup = scene.nextGroup;
     undoStack = [];
     redoStack = [];
     return true;
@@ -202,20 +355,29 @@ function updateHash() {
 
 // --- Worker bridge ----------------------------------------------------------
 
-function resendScene(extraSeg, throttled) {
+function resendScene(throttled) {
   if (!light) return;
   const now = performance.now();
   if (throttled && now - lastSceneSend < PREVIEW_MS) return;
   lastSceneSend = now;
-  const segs = extraSeg ? segments.concat([extraSeg]) : segments.slice();
+  const all = prims.concat(gesturePrims());
+  const segs = [], arcList = [];
+  for (const p of all) {
+    if (p.kind === 'seg') {
+      segs.push({ x1: p.x1, y1: p.y1, x2: p.x2, y2: p.y2, type: p.type });
+    } else {
+      arcList.push({ cx: p.cx, cy: p.cy, r: p.r, a0: p.a0, span: p.span, type: p.type });
+    }
+  }
   worker.postMessage({
     type: 'scene',
     segments: segs,
+    arcs: arcList,
     light: { x: light.x, y: light.y },
   });
   raysTraced = 0;
   lastRays = 0;
-  if (!throttled && !extraSeg) updateHash();
+  if (!throttled && !gesture && !arcState) updateHash();
 }
 
 function onWorkerMessage(e) {
@@ -248,27 +410,31 @@ function formatNumber(n) {
   return Math.round(n).toString();
 }
 
-// --- Overlay (lines being drawn + light marker) -----------------------------
+// --- Overlay (geometry outlines + light marker) -----------------------------
+
+function strokePrim(p, color, width) {
+  octx.strokeStyle = color;
+  octx.lineWidth = width;
+  octx.beginPath();
+  if (p.kind === 'seg') {
+    octx.moveTo(p.x1, p.y1);
+    octx.lineTo(p.x2, p.y2);
+  } else {
+    octx.arc(p.cx, p.cy, p.r, p.a0, p.a0 + p.span);
+  }
+  octx.stroke();
+}
 
 function drawOverlay() {
   octx.clearRect(0, 0, W, H);
 
-  octx.lineWidth = 1;
-  for (const s of segments) {
-    octx.strokeStyle = withAlpha(COLORS[s.type], 0.45);
-    octx.beginPath();
-    octx.moveTo(s.x1, s.y1);
-    octx.lineTo(s.x2, s.y2);
-    octx.stroke();
+  const movingGroup = moving && !moving.lightOnly ? moving.group : -1;
+  for (const p of prims) {
+    const active = p.group === movingGroup;
+    strokePrim(p, withAlpha(COLORS[p.type], active ? 0.9 : 0.45), active ? 1.5 : 1);
   }
-
-  if (dragging) {
-    octx.lineWidth = 1.5;
-    octx.strokeStyle = COLORS[dragging.type];
-    octx.beginPath();
-    octx.moveTo(dragging.x1, dragging.y1);
-    octx.lineTo(dragging.x2, dragging.y2);
-    octx.stroke();
+  for (const p of gesturePrims()) {
+    strokePrim(p, COLORS[p.type], 1.5);
   }
 
   if (light) {
@@ -291,23 +457,39 @@ function withAlpha(hex, a) {
 
 // --- Input handling ---------------------------------------------------------
 
-const TOOL_KEYS = {
-  '1': 'light',   l: 'light',
-  '2': 'diffuse', d: 'diffuse',
-  '3': 'mirror',  m: 'mirror',
-  '4': 'glass',   g: 'glass',
-  '5': 'erase',   e: 'erase',
+const MODE_KEYS = {
+  '1': 'light',  l: 'light',
+  '2': 'move',   v: 'move',
+  '3': 'line',   w: 'line',
+  '4': 'arc',    a: 'arc',
+  '5': 'circle', c: 'circle',
+  '6': 'box',    r: 'box',
+  '7': 'lens',   f: 'lens',
+  '8': 'erase',  e: 'erase',
 };
+const MAT_KEYS = { d: TYPE_DIFFUSE, m: TYPE_MIRROR, g: TYPE_GLASS };
 
-function selectTool(name) {
-  tool = name;
-  toolButtons.forEach((b) => b.classList.toggle('active', b.dataset.tool === name));
-  overlay.style.cursor = name === 'erase' ? 'cell' : 'crosshair';
+function selectMode(name) {
+  cancelInteraction();
+  mode = name;
+  if (name === 'lens' && material !== TYPE_GLASS) selectMaterial(TYPE_GLASS);
+  modeButtons.forEach((b) => b.classList.toggle('active', b.dataset.mode === name));
+  overlay.style.cursor =
+    name === 'erase' ? 'cell' : name === 'move' ? 'default' : 'crosshair';
+}
+
+function selectMaterial(t) {
+  material = t;
+  matButtons.forEach((b) => b.classList.toggle('active', +b.dataset.mat === t));
+  if (arcState || gesture) drawOverlay();
 }
 
 function bindUI() {
-  for (const btn of toolButtons) {
-    btn.addEventListener('click', () => selectTool(btn.dataset.tool));
+  for (const btn of modeButtons) {
+    btn.addEventListener('click', () => selectMode(btn.dataset.mode));
+  }
+  for (const btn of matButtons) {
+    btn.addEventListener('click', () => selectMaterial(+btn.dataset.mat));
   }
 
   expSlider.addEventListener('input', () => {
@@ -322,7 +504,7 @@ function bindUI() {
   document.getElementById('redo').addEventListener('click', redo);
   document.getElementById('clear').addEventListener('click', () => {
     pushHistory();
-    segments = [];
+    prims = [];
     drawOverlay();
     resendScene();
   });
@@ -336,9 +518,10 @@ function bindUI() {
       e.preventDefault(); redo(); return;
     }
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (e.key === 'Escape') { cancelDrag(); return; }
-    const t = TOOL_KEYS[e.key.toLowerCase()];
-    if (t) selectTool(t);
+    if (e.key === 'Escape') { cancelInteraction(); drawOverlay(); return; }
+    const k = e.key.toLowerCase();
+    if (MODE_KEYS[k] !== undefined) { selectMode(MODE_KEYS[k]); return; }
+    if (MAT_KEYS[k] !== undefined) selectMaterial(MAT_KEYS[k]);
   });
 
   overlay.addEventListener('pointerdown', onPointerDown);
@@ -347,7 +530,8 @@ function bindUI() {
   overlay.addEventListener('pointercancel', onPointerUp);
   overlay.addEventListener('contextmenu', (e) => e.preventDefault());
 
-  selectTool(tool);
+  selectMode(mode);
+  selectMaterial(material);
 }
 
 function eventToCanvas(e) {
@@ -365,43 +549,110 @@ function dismissHint() {
 function onPointerDown(e) {
   overlay.setPointerCapture(e.pointerId);
   const p = eventToCanvas(e);
-  if (tool === 'light') {
-    pushHistory();
-    light = { x: p.x, y: p.y };
-    draggingLight = true;
-    drawOverlay();
-    resendScene();
+
+  // Second stage of the arc tool: this click commits the bent arc.
+  if (arcState && arcState.stage === 2) {
+    const list = gesturePrims();
+    arcState = null;
+    commitPrims(list);
     return;
   }
-  if (tool === 'erase') {
-    erasing = true;
-    eraseSnapshot = snapshot();
-    eraseAt(p);
-    return;
+
+  switch (mode) {
+    case 'light':
+      pushHistory();
+      light = { x: p.x, y: p.y };
+      draggingLight = true;
+      drawOverlay();
+      resendScene();
+      return;
+    case 'move': {
+      const snap = snapshot();
+      if (Math.hypot(p.x - light.x, p.y - light.y) < 12) {
+        moving = { lightOnly: true, startX: p.x, startY: p.y, snap, moved: false };
+        return;
+      }
+      const hit = hitPrim(p, 8);
+      if (hit >= 0) {
+        moving = { lightOnly: false, group: prims[hit].group,
+                   startX: p.x, startY: p.y, snap, moved: false };
+        drawOverlay();
+      }
+      return;
+    }
+    case 'erase':
+      erasing = true;
+      eraseSnapshot = snapshot();
+      eraseAt(p);
+      return;
+    case 'arc':
+      arcState = { ax: p.x, ay: p.y, bx: p.x, by: p.y, stage: 1, px: p.x, py: p.y };
+      drawOverlay();
+      return;
+    default: // line | box | circle | lens
+      gesture = { x1: p.x, y1: p.y, x2: p.x, y2: p.y };
+      drawOverlay();
   }
-  const type = typeFromTool(tool);
-  dragging = { x1: p.x, y1: p.y, x2: p.x, y2: p.y, type };
-  drawOverlay();
 }
 
 function onPointerMove(e) {
+  const p = eventToCanvas(e);
+
   if (draggingLight) {
-    const p = eventToCanvas(e);
     light = { x: p.x, y: p.y };
     drawOverlay();
-    resendScene(null, true);
+    resendScene(true);
+    return;
+  }
+  if (moving) {
+    const dx = p.x - moving.startX;
+    const dy = p.y - moving.startY;
+    moving.moved = moving.moved || Math.hypot(dx, dy) >= 2;
+    if (moving.lightOnly) {
+      light.x = moving.snap.light.x + dx;
+      light.y = moving.snap.light.y + dy;
+    } else {
+      for (let i = 0; i < prims.length; i++) {
+        if (prims[i].group !== moving.group) continue;
+        const o = moving.snap.prims[i];
+        const t = prims[i];
+        if (t.kind === 'seg') {
+          t.x1 = o.x1 + dx; t.y1 = o.y1 + dy;
+          t.x2 = o.x2 + dx; t.y2 = o.y2 + dy;
+        } else {
+          t.cx = o.cx + dx; t.cy = o.cy + dy;
+        }
+      }
+    }
+    drawOverlay();
+    resendScene(true);
     return;
   }
   if (erasing) {
-    eraseAt(eventToCanvas(e));
+    eraseAt(p);
     return;
   }
-  if (!dragging) return;
-  const p = eventToCanvas(e);
-  dragging.x2 = p.x;
-  dragging.y2 = p.y;
-  drawOverlay();
-  resendScene(dragging, true); // live render preview while drawing
+  if (arcState) {
+    if (arcState.stage === 1) {
+      arcState.bx = p.x; arcState.by = p.y;
+    } else {
+      arcState.px = p.x; arcState.py = p.y;
+      resendScene(true);
+    }
+    drawOverlay();
+    return;
+  }
+  if (gesture) {
+    gesture.x2 = p.x;
+    gesture.y2 = p.y;
+    drawOverlay();
+    resendScene(true); // live render preview while drawing
+    return;
+  }
+  if (mode === 'move') {
+    const nearLight = Math.hypot(p.x - light.x, p.y - light.y) < 12;
+    overlay.style.cursor = nearLight || hitPrim(p, 8) >= 0 ? 'move' : 'default';
+  }
 }
 
 function onPointerUp(e) {
@@ -411,43 +662,67 @@ function onPointerUp(e) {
     resendScene();
     return;
   }
+  if (moving) {
+    const m = moving;
+    moving = null;
+    if (m.moved) {
+      undoStack.push(m.snap);
+      if (undoStack.length > 100) undoStack.shift();
+      redoStack.length = 0;
+      dismissHint();
+    } else {
+      restore(m.snap); // undo the sub-threshold nudge
+    }
+    drawOverlay();
+    resendScene();
+    return;
+  }
   if (erasing) {
     erasing = false;
     eraseSnapshot = null;
     return;
   }
-  if (!dragging) return;
-  const p = eventToCanvas(e);
-  dragging.x2 = p.x;
-  dragging.y2 = p.y;
-  const dx = dragging.x2 - dragging.x1;
-  const dy = dragging.y2 - dragging.y1;
-  if (Math.hypot(dx, dy) >= 2) {
-    pushHistory();
-    segments.push(dragging);
-    dismissHint();
-  }
-  dragging = null;
-  drawOverlay();
-  resendScene();
-}
-
-function cancelDrag() {
-  if (draggingLight) {
-    draggingLight = false;
-    undo(); // light position was snapshotted on pointerdown
+  if (arcState && arcState.stage === 1) {
+    const p = eventToCanvas(e);
+    arcState.bx = p.x; arcState.by = p.y;
+    if (Math.hypot(arcState.bx - arcState.ax, arcState.by - arcState.ay) < 6) {
+      arcState = null; // too short to be a chord
+      drawOverlay();
+      resendScene();
+    } else {
+      arcState.stage = 2; // now bend with the pointer; click to commit
+      arcState.px = arcState.bx; arcState.py = arcState.by;
+      drawOverlay();
+    }
     return;
   }
-  if (dragging) {
-    dragging = null;
+  if (gesture) {
+    const p = eventToCanvas(e);
+    gesture.x2 = p.x;
+    gesture.y2 = p.y;
+    const list = gesturePrims();
+    gesture = null;
+    if (list.length) commitPrims(list);
+    else { drawOverlay(); resendScene(); }
+  }
+}
+
+function cancelInteraction() {
+  if (draggingLight) { draggingLight = false; undo(); }
+  if (moving) { restore(moving.snap); moving = null; }
+  if (arcState || gesture) {
+    arcState = null;
+    gesture = null;
     drawOverlay();
     resendScene();
   }
+  erasing = false;
+  eraseSnapshot = null;
 }
 
-// Erase every segment under the pointer; one undo step per erase gesture.
+// Erase the whole group under the pointer; one undo step per erase gesture.
 function eraseAt(p) {
-  const idx = findSegmentNear(p.x, p.y, 6);
+  const idx = hitPrim(p, 6);
   if (idx < 0) return;
   if (eraseSnapshot) {
     undoStack.push(eraseSnapshot);
@@ -455,22 +730,19 @@ function eraseAt(p) {
     redoStack.length = 0;
     eraseSnapshot = null;
   }
-  segments.splice(idx, 1);
+  const g = prims[idx].group;
+  prims = prims.filter((q) => q.group !== g);
   drawOverlay();
   resendScene();
 }
 
-function typeFromTool(t) {
-  if (t === 'mirror') return TYPE_MIRROR;
-  if (t === 'glass')  return TYPE_GLASS;
-  return TYPE_DIFFUSE;
-}
-
-function findSegmentNear(x, y, maxDist) {
+function hitPrim(p, maxDist) {
   let bestIdx = -1;
   let bestD = maxDist;
-  for (let i = 0; i < segments.length; i++) {
-    const d = pointSegmentDist(x, y, segments[i]);
+  for (let i = 0; i < prims.length; i++) {
+    const d = prims[i].kind === 'seg'
+      ? pointSegmentDist(p.x, p.y, prims[i])
+      : pointArcDist(p.x, p.y, prims[i]);
     if (d < bestD) { bestD = d; bestIdx = i; }
   }
   return bestIdx;
@@ -487,6 +759,19 @@ function pointSegmentDist(px, py, s) {
   return Math.hypot(px - cx, py - cy);
 }
 
+function pointArcDist(px, py, a) {
+  const dx = px - a.cx, dy = py - a.cy;
+  const ang = Math.atan2(dy, dx);
+  if (ccwDist(a.a0, ang) <= a.span) {
+    return Math.abs(Math.hypot(dx, dy) - a.r);
+  }
+  const e0x = a.cx + a.r * Math.cos(a.a0);
+  const e0y = a.cy + a.r * Math.sin(a.a0);
+  const e1x = a.cx + a.r * Math.cos(a.a0 + a.span);
+  const e1y = a.cy + a.r * Math.sin(a.a0 + a.span);
+  return Math.min(Math.hypot(px - e0x, py - e0y), Math.hypot(px - e1x, py - e1y));
+}
+
 // --- History ----------------------------------------------------------------
 
 function pushHistory() {
@@ -497,12 +782,14 @@ function pushHistory() {
 function snapshot() {
   return {
     light: { x: light.x, y: light.y },
-    segments: segments.map((s) => ({ ...s })),
+    prims: prims.map((p) => ({ ...p })),
+    nextGroup,
   };
 }
 function restore(snap) {
   light = { x: snap.light.x, y: snap.light.y };
-  segments = snap.segments.map((s) => ({ ...s }));
+  prims = snap.prims.map((p) => ({ ...p }));
+  nextGroup = snap.nextGroup;
   drawOverlay();
   resendScene();
 }

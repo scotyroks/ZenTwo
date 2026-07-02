@@ -19,13 +19,25 @@ deploys automatically.
 
 ## Controls
 
-- **Light** — click or drag to move the source (`1`/`L`)
-- **Diffuse / Mirror / Glass** — drag to draw a wall segment (`2`/`D`, `3`/`M`, `4`/`G`)
-- **Erase** — click or drag over segments to remove them (`5`/`E`)
+Tools (left group) choose *what* you draw; materials (second group) choose
+*what it's made of*.
+
+- **Light** (`1`/`L`) — click or drag to move the source
+- **Move** (`2`/`V`) — drag shapes or the light; shapes move as one object
+- **Line** (`3`/`W`) — drag a wall segment
+- **Arc** (`4`/`A`) — drag the chord, release, bend the curve with the
+  pointer, click to commit
+- **Circle** (`5`/`C`) — drag outward from the center
+- **Box** (`6`/`R`) — drag a rectangle
+- **Lens** (`7`/`F`) — drag the lens diameter; creates a biconvex lens from
+  two spherical surfaces (auto-selects glass)
+- **Erase** (`8`/`E`) — click or drag over a shape to remove it
+- **Materials**: Diffuse (`D`), Mirror (`M`), Glass (`G`)
 - Exposure slider (double-click resets), Undo (`⌘Z`), Redo (`⌘⇧Z`), Clear
-- **Save PNG** — download the current render
+- **PNG** — download the current render
 - **Share** — copy a link that reproduces the scene; scenes are encoded in
-  the URL hash with resolution-independent coordinates
+  the URL hash with resolution-independent coordinates (older links from
+  the segment-only format still load)
 - `Esc` cancels an in-progress drag; touch and stylus input work directly
   on the canvas
 
@@ -44,6 +56,12 @@ The simulation is a spectral Monte Carlo light tracer. Per photon:
 - **Dispersion** — glass is SCHOTT N-BK7; the refractive index per
   wavelength comes from the Sellmeier equation, so prisms produce
   physically correct rainbows.
+- **Exact curved surfaces** — arcs and circles use analytic ray-circle
+  intersection with radial normals, not polyline approximation. Lenses are
+  true spherical optics: they focus per the lensmaker's equation and show
+  real spherical and chromatic aberration. A ray inside a lens can hit the
+  same surface again on exit (arc self-intersection is epsilon-excluded,
+  not identity-excluded like straight segments).
 - **Fresnel with polarization** — glass interfaces use the exact dielectric
   Fresnel equations. In 2D the plane of incidence is the simulation plane,
   so each photon's s/p polarization state is tracked exactly and compounds
@@ -81,9 +99,10 @@ node test/smoke.js
 ```
 
 Runs the worker headlessly and asserts (1) an empty scene renders neutral
-white — validating the spectral pipeline end to end — and (2) a
+white — validating the spectral pipeline end to end — (2) a
 slit-collimated beam through a prism disperses, with blue deviated further
-than red.
+than red, and (3) a biconvex lens focuses a beam where the thick-lens
+equation predicts (within aberration tolerance).
 
 ## Architecture
 

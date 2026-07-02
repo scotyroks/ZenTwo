@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<meta name="description" content="ZenTwo — an interactive spectral raytracer art toy. Draw walls, mirrors, and prisms; watch millions of photons paint with real light physics." />
+<meta name="description" content="ZenTwo — an interactive spectral raytracer art toy. Draw walls, mirrors, prisms, and lenses; watch millions of photons paint with real light physics." />
 <meta name="theme-color" content="#07080b" />
 <meta property="og:title" content="ZenTwo — Photon Garden" />
-<meta property="og:description" content="Draw with light. A physically accurate 2D spectral raytracer in your browser — real glass dispersion, Fresnel reflection, and rainbow-making prisms." />
+<meta property="og:description" content="Draw with light. A physically accurate 2D spectral raytracer in your browser — real glass dispersion, Fresnel reflection, curved lenses, and rainbow-making prisms." />
 <meta property="og:type" content="website" />
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%2307080b'/%3E%3Cpolygon points='32,12 53,50 11,50' fill='none' stroke='%23ffd76a' stroke-width='4' stroke-linejoin='round'/%3E%3Ccircle cx='32' cy='38' r='5' fill='%23ffd76a'/%3E%3C/svg%3E" />
 <title>ZenTwo — Photon Garden</title>
@@ -19,21 +19,30 @@
 </div>
 
 <div id="toolbar">
-  <div class="group" id="tools">
-    <button class="tool active" data-tool="light"  title="Light source — click or drag to move (1 or L)">
+  <div class="group" id="modes">
+    <button class="tool active" data-mode="light"  title="Light source — click or drag to move (1 or L)">
       <span class="dot light"></span><span>Light</span>
     </button>
-    <button class="tool" data-tool="diffuse"  title="Diffuse wall — scatters light (2 or D)">
+    <button class="tool" data-mode="move"   title="Move — drag shapes or the light (2 or V)">✥ Move</button>
+    <button class="tool" data-mode="line"   title="Line wall (3 or W)">╱ Line</button>
+    <button class="tool" data-mode="arc"    title="Arc — drag the chord, then bend with the pointer and click to commit (4 or A)">◠ Arc</button>
+    <button class="tool" data-mode="circle" title="Circle — drag from center (5 or C)">○ Circle</button>
+    <button class="tool" data-mode="box"    title="Box — drag a rectangle (6 or R)">▭ Box</button>
+    <button class="tool" data-mode="lens"   title="Lens — drag the lens diameter; two spherical surfaces (7 or F)">◗ Lens</button>
+    <button class="tool" data-mode="erase"  title="Erase — click or drag over shapes to remove them (8 or E)">
+      <span class="dot erase"></span><span>Erase</span>
+    </button>
+  </div>
+
+  <div class="group" id="materials">
+    <button class="tool active" data-mat="0" title="Diffuse — scatters light like matte paint (D)">
       <span class="dot diffuse"></span><span>Diffuse</span>
     </button>
-    <button class="tool" data-tool="mirror"   title="Mirror — reflects light (3 or M)">
+    <button class="tool" data-mat="1" title="Mirror — reflects light (M)">
       <span class="dot mirror"></span><span>Mirror</span>
     </button>
-    <button class="tool" data-tool="glass"    title="Glass — refracts and disperses light (4 or G)">
+    <button class="tool" data-mat="2" title="Glass — BK7, refracts and disperses light (G)">
       <span class="dot glass"></span><span>Glass</span>
-    </button>
-    <button class="tool" data-tool="erase"    title="Erase — click or drag over walls to remove (5 or E)">
-      <span class="dot erase"></span><span>Erase</span>
     </button>
   </div>
 
@@ -48,8 +57,8 @@
   <div class="group">
     <button id="undo"  title="Undo (Ctrl/⌘+Z)">Undo</button>
     <button id="redo"  title="Redo (Ctrl/⌘+Shift+Z)">Redo</button>
-    <button id="clear" title="Clear all walls">Clear</button>
-    <button id="save"  title="Save the rendered image">Save PNG</button>
+    <button id="clear" title="Clear all shapes">Clear</button>
+    <button id="save"  title="Save the rendered image">PNG</button>
     <button id="share" title="Copy a link to this scene">Share</button>
   </div>
 </div>
@@ -60,8 +69,8 @@
 </div>
 
 <div id="hint">
-  Drag the light to move it. Pick a material and drag to draw walls.
-  Glass is real BK7 — build a prism and watch the spectrum split.
+  Drag the light to move it. Draw lines, boxes, circles, and lenses in
+  diffuse, mirror, or BK7 glass — then move them around with the Move tool.
 </div>
 
 <script src="main.js"></script>

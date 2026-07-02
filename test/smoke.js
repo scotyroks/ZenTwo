@@ -15,7 +15,7 @@ const path = require('path');
 
 const W = 320, H = 240;
 
-function runScene(light, segments, ms) {
+function runScene(light, segments, ms, arcs) {
   return new Promise((resolve) => {
     let lastFrame = null;
     global.self = {
@@ -32,7 +32,7 @@ function runScene(light, segments, ms) {
     const post = (data) => global.self.onmessage({ data });
     post({ type: 'init', width: W, height: H });
     post({ type: 'exposure', value: 1 });
-    post({ type: 'scene', light, segments });
+    post({ type: 'scene', light, segments, arcs: arcs || [] });
     post({ type: 'start' });
     setTimeout(() => {
       post({ type: 'stop' });
@@ -92,6 +92,52 @@ function fail(msg) {
     if (redDom < 60 || blueDom < 60) fail('no visible dispersion');
     // Apex-up prism deviates toward the base (down); blue bends more.
     if (blueY / blueDom <= redY / redDom) fail('dispersion order wrong (blue should deviate more)');
+  }
+
+  // 3. Biconvex lens focuses a slit beam near the thick-lens prediction.
+  {
+    // Lens: vertical chord x=160, y∈[80,160]; two arcs, sagitta 17.6 each.
+    // R = (h² + s²) / (2s) = (40² + 17.6²) / 35.2 ≈ 54.25.
+    // Thick lensmaker (n≈1.5185 at 550nm, t=35.2): f ≈ 59 from the center;
+    // the source sits 130 before the lens, so the image lands near
+    // v = 1/(1/f − 1/u) ≈ 107 past it → x ≈ 267, y = 120.
+    function arcThrough(ax, ay, bx, by, px, py) {
+      const d = 2 * (ax * (by - py) + bx * (py - ay) + px * (ay - by));
+      const a2 = ax * ax + ay * ay, b2 = bx * bx + by * by, p2 = px * px + py * py;
+      const cx = (a2 * (by - py) + b2 * (py - ay) + p2 * (ay - by)) / d;
+      const cy = (a2 * (px - bx) + b2 * (ax - px) + p2 * (bx - ax)) / d;
+      const r = Math.hypot(ax - cx, ay - cy);
+      const TWO_PI = 2 * Math.PI;
+      const ccw = (a, b) => { let v = b - a; v -= Math.floor(v / TWO_PI) * TWO_PI; return v; };
+      const angA = Math.atan2(ay - cy, ax - cx);
+      const angB = Math.atan2(by - cy, bx - cx);
+      const angP = Math.atan2(py - cy, px - cx);
+      return ccw(angA, angP) <= ccw(angA, angB)
+        ? { cx, cy, r, a0: angA, span: ccw(angA, angB), type: 2 }
+        : { cx, cy, r, a0: angB, span: ccw(angB, angA), type: 2 };
+    }
+    const s = 17.6;
+    const arcs = [
+      arcThrough(160, 80, 160, 160, 160 + s, 120),
+      arcThrough(160, 80, 160, 160, 160 - s, 120),
+    ];
+    const frame = await runScene({ x: 30, y: 120 }, [
+      { x1: 90, y1: -50, x2: 90, y2: 116, type: 0 },
+      { x1: 90, y1: 124, x2: 90, y2: 290, type: 0 },
+    ], 4000, arcs);
+    const px = new Uint8Array(frame.buffer);
+    let bx = -1, by = -1, bv = -1;
+    for (let y = 0; y < 240; y++) {
+      for (let x = 185; x < W; x++) {
+        const i = (y * W + x) * 4;
+        const v = px[i] + px[i + 1] + px[i + 2];
+        if (v > bv) { bv = v; bx = x; by = y; }
+      }
+    }
+    console.log(`lens scene: rays=${(frame.rays / 1e6).toFixed(2)}M focus at (${bx},${by})`);
+    if (bv <= 0) fail('no light passed the lens');
+    if (bx < 205 || bx > 315) fail(`focus x=${bx} outside expected [205,315]`);
+    if (by < 104 || by > 136) fail(`focus y=${by} outside expected [104,136]`);
   }
 
   console.log('OK');
